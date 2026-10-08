@@ -1,0 +1,1603 @@
+V6.4
+// ==UserScript==
+// @name         Tennr Auto Hunt V6.4 Reliable Fax Detection
+// @namespace    tennr
+// @version      6.4
+// @description  F8/F9 API-based hunting with reliable fax detection and auto-resume
+// @match        https://app.tennr.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const AUTO_HUNT_KEY = 'tennrAutoHuntV6';
+    const STATS_KEY = 'tennrAutoHuntStatsV6';
+
+    const START_KEY = 'F8';
+    const STOP_KEY = 'F9';
+
+    const PAGE_CHECK_INTERVAL = 250;
+    const TASK_OPEN_CONFIRMATIONS = 2;
+    const WORKSPACE_CONFIRMATIONS = 3;
+    const RESUME_DELAY = 1000;
+    const API_POLL_INTERVAL = 500;
+    const API_ASSIGNMENT_RELOAD_DELAY = 350;
+
+    let autoModeEnabled =
+        localStorage.getItem(AUTO_HUNT_KEY) === 'on';
+
+    let hunting = false;
+    let taskOpen = false;
+
+    let ctrlSpamTimer = null;
+    let cycleTimeout = null;
+    let holdTimeout = null;
+    let reloadTimeout = null;
+
+    let apiPollTimer = null;
+    let apiRequestInFlight = false;
+    let apiAuthorization = null;
+    let apiUserId = null;
+    let apiTimezone = null;
+    let apiAssignmentReloadTimeout = null;
+    let nativeFetch = null;
+
+    let resumeTimeout = null;
+    let pageMonitorTimer = null;
+    let taskObserver = null;
+
+    let taskOpenChecks = 0;
+    let workspaceChecks = 0;
+
+    let cycleStartUrl = location.href;
+    let lastTaskCandidate = null;
+
+    let stats = loadStats();
+
+    function loadStats() {
+        try {
+            const saved = JSON.parse(
+                localStorage.getItem(STATS_KEY) || '{}'
+            );
+
+            return {
+                retries: Number(saved.retries) || 0,
+                apiAttempts: Number(saved.apiAttempts) || 0,
+                apiCandidates: Number(saved.apiCandidates) || 0,
+                confirmedTasks: Number(saved.confirmedTasks) || 0
+            };
+        } catch (error) {
+            return {
+                retries: 0,
+                apiAttempts: 0,
+                apiCandidates: 0,
+                confirmedTasks: 0
+            };
+        }
+    }
+
+    function saveStats() {
+        try {
+            localStorage.setItem(
+                STATS_KEY,
+                JSON.stringify(stats)
+            );
+        } catch (error) {
+            console.debug(
+                '[Tennr Hunt] Could not save statistics:',
+                error
+            );
+        }
+    }
+
+    function isElementVisible(element) {
+        if (!element || !element.isConnected) {
+            return false;
+        }
+
+        const style = window.getComputedStyle(element);
+        const rectangle = element.getBoundingClientRect();
+
+        return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity) !== 0 &&
+            rectangle.width > 0 &&
+            rectangle.height > 0
+        );
+    }
+
+    function findVisibleElement(selector) {
+        try {
+            return [...document.querySelectorAll(selector)]
+                .find(isElementVisible) || null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function findVisibleButton(text) {
+        const normalizedTarget = text
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        return [...document.querySelectorAll('button')]
+            .find((button) => {
+                if (!isElementVisible(button)) {
+                    return false;
+                }
+
+                const buttonText = (
+                    button.textContent || ''
+                )
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+
+                const buttonTitle = (
+                    button.getAttribute('title') || ''
+                )
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+
+                return (
+                    buttonText === normalizedTarget ||
+                    buttonTitle === normalizedTarget
+                );
+            }) || null;
+    }
+
+    function getPageText() {
+        return (
+            document.body?.innerText || ''
+        )
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function isFaxTaskOpen() {
+        const sourceViewer =
+            document.getElementById(
+                'SourceViewerContainer'
+            );
+
+        if (
+            sourceViewer &&
+            isElementVisible(sourceViewer)
+        ) {
+            return true;
+        }
+
+        const pdfDocument =
+            findVisibleElement(
+                '.react-pdf__Document'
+            );
+
+        if (pdfDocument) {
+            return true;
+        }
+
+        const pdfPage =
+            findVisibleElement(
+                '.react-pdf__Page'
+            );
+
+        if (pdfPage) {
+            return true;
+        }
+
+        const everythingLooksRight =
+            findVisibleButton(
+                'Everything looks right'
+            );
+
+        if (everythingLooksRight) {
+            return true;
+        }
+
+        const validationSection =
+            findVisibleElement(
+                '[data-validate-scroll-target="true"]'
+            );
+
+        const validationField =
+            findVisibleElement(
+                '[id^="validate-entry-"]'
+            );
+
+        if (
+            validationSection &&
+            validationField
+        ) {
+            return true;
+        }
+
+        const pdfFilename =
+            findVisibleElement(
+                '[title$=".pdf" i]'
+            );
+
+        if (pdfFilename) {
+            return true;
+        }
+
+        const pageText = getPageText();
+
+        const hasPatientSearch =
+            pageText.includes('patient search');
+
+        const hasDocumentClassification =
+            pageText.includes(
+                'document classification'
+            );
+
+        const hasBadFax =
+            pageText.includes('bad fax');
+
+        if (
+            hasPatientSearch &&
+            (
+                hasDocumentClassification ||
+                hasBadFax
+            )
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function isIdleWorkspaceOpen() {
+        if (isFaxTaskOpen()) {
+            return false;
+        }
+
+        const onWorkspaceRoute =
+            location.pathname === '/workspace' ||
+            location.pathname === '/workspace/';
+
+        if (!onWorkspaceRoute) {
+            return false;
+        }
+
+        const pageText = getPageText();
+
+        const caughtUpText =
+            pageText.includes(
+                'all caught up! no pending tasks right now.'
+            );
+
+        if (caughtUpText) {
+            return true;
+        }
+
+        const hasAssignedWorkflows =
+            pageText.includes(
+                'your assigned workflows'
+            );
+
+        const hasNeedsReview =
+            pageText.includes('needs review');
+
+        const hasDoneToday =
+            pageText.includes('done today');
+
+        return (
+            hasAssignedWorkflows &&
+            hasNeedsReview &&
+            hasDoneToday
+        );
+    }
+
+    function updateIndicator() {
+        const indicator =
+            document.getElementById(
+                'tennr-hunt-indicator'
+            );
+
+        if (!indicator) {
+            return;
+        }
+
+        const activelyHunting =
+            autoModeEnabled &&
+            hunting &&
+            !taskOpen;
+
+        indicator.classList.toggle(
+            'tennr-hunt-running',
+            activelyHunting
+        );
+
+        indicator.classList.toggle(
+            'tennr-hunt-stopped',
+            !activelyHunting
+        );
+    }
+
+    function createStatusIndicator() {
+        if (
+            !document.getElementById(
+                'tennr-hunt-indicator-style'
+            )
+        ) {
+            const style =
+                document.createElement('style');
+
+            style.id =
+                'tennr-hunt-indicator-style';
+
+            style.textContent = `
+                #tennr-hunt-indicator {
+                    position: fixed;
+                    right: 0px;
+                    bottom: -8px;
+                    width: 13px;
+                    height: 13px;
+                    border: 2px solid #ffffff;
+                    border-radius: 50%;
+                    z-index: 2147483647;
+                    pointer-events: none;
+                    box-sizing: border-box;
+                    background: #777777;
+                    transition: background 0.15s ease;
+                }
+
+                #tennr-hunt-indicator.tennr-hunt-running {
+                    background: #20c96b;
+                    box-shadow: 0 0 8px rgba(32, 201, 107, 0.85);
+                }
+
+                #tennr-hunt-indicator.tennr-hunt-stopped {
+                    background: #e53935;
+                    box-shadow: 0 0 6px rgba(229, 57, 53, 0.65);
+                }
+            `;
+
+            document.head.appendChild(style);
+        }
+
+        if (
+            !document.getElementById(
+                'tennr-hunt-indicator'
+            )
+        ) {
+            const indicator =
+                document.createElement('div');
+
+            indicator.id =
+                'tennr-hunt-indicator';
+
+            document.body.appendChild(indicator);
+        }
+
+        updateIndicator();
+    }
+
+    function clearHuntTimers() {
+        if (ctrlSpamTimer !== null) {
+            clearInterval(ctrlSpamTimer);
+            ctrlSpamTimer = null;
+        }
+
+        if (cycleTimeout !== null) {
+            clearTimeout(cycleTimeout);
+            cycleTimeout = null;
+        }
+
+        if (holdTimeout !== null) {
+            clearTimeout(holdTimeout);
+            holdTimeout = null;
+        }
+
+        if (reloadTimeout !== null) {
+            clearTimeout(reloadTimeout);
+            reloadTimeout = null;
+        }
+
+        if (apiAssignmentReloadTimeout !== null) {
+            clearTimeout(apiAssignmentReloadTimeout);
+            apiAssignmentReloadTimeout = null;
+        }
+
+        stopApiHunter();
+
+        stopCtrlSpam();
+    }
+
+    function clearResumeTimer() {
+        if (resumeTimeout !== null) {
+            clearTimeout(resumeTimeout);
+            resumeTimeout = null;
+        }
+    }
+
+    function stopCtrlSpam() {
+        if (ctrlSpamTimer !== null) {
+            clearInterval(ctrlSpamTimer);
+            ctrlSpamTimer = null;
+        }
+
+        releaseCtrlEnter();
+    }
+
+    function fireCtrlEnter() {
+        const eventOptions = {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+            ctrlKey: true
+        };
+
+        document.dispatchEvent(
+            new KeyboardEvent(
+                'keydown',
+                eventOptions
+            )
+        );
+
+        document.dispatchEvent(
+            new KeyboardEvent(
+                'keyup',
+                eventOptions
+            )
+        );
+    }
+
+    function holdCtrlEnter(duration) {
+        releaseCtrlEnter();
+
+        const eventOptions = {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+            ctrlKey: true
+        };
+
+        document.dispatchEvent(
+            new KeyboardEvent(
+                'keydown',
+                eventOptions
+            )
+        );
+
+        holdTimeout = setTimeout(() => {
+            releaseCtrlEnter();
+        }, duration);
+    }
+
+    function releaseCtrlEnter() {
+        if (holdTimeout !== null) {
+            clearTimeout(holdTimeout);
+            holdTimeout = null;
+        }
+
+        const eventOptions = {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+            ctrlKey: true
+        };
+
+        document.dispatchEvent(
+            new KeyboardEvent(
+                'keyup',
+                eventOptions
+            )
+        );
+    }
+
+    function startCtrlSpam() {
+        stopCtrlSpam();
+
+        fireCtrlEnter();
+
+        ctrlSpamTimer = setInterval(() => {
+            if (
+                !autoModeEnabled ||
+                !hunting ||
+                taskOpen
+            ) {
+                stopCtrlSpam();
+                return;
+            }
+
+            if (isFaxTaskOpen()) {
+                stopCtrlSpam();
+                pauseForOpenTask();
+                return;
+            }
+
+            fireCtrlEnter();
+        }, 50);
+    }
+
+    function getRandomHoldDuration() {
+        return (
+            Math.floor(
+                Math.random() * 7000
+            ) + 5000
+        );
+    }
+
+    function pauseForOpenTask() {
+        if (taskOpen) {
+            return;
+        }
+
+        taskOpen = true;
+        hunting = false;
+
+        clearHuntTimers();
+        clearResumeTimer();
+
+        taskOpenChecks = 0;
+        workspaceChecks = 0;
+
+        stats.confirmedTasks += 1;
+        saveStats();
+
+        updateIndicator();
+
+        console.log(
+            '[Tennr Hunt] Fax detected. Hunt paused.'
+        );
+
+        scheduleAutomaticResume();
+    }
+
+    function scheduleAutomaticResume() {
+        clearResumeTimer();
+
+        resumeTimeout = setTimeout(() => {
+            resumeTimeout = null;
+
+            if (!autoModeEnabled) {
+                return;
+            }
+
+            if (isFaxTaskOpen()) {
+                scheduleAutomaticResume();
+                return;
+            }
+
+            if (!isIdleWorkspaceOpen()) {
+                scheduleAutomaticResume();
+                return;
+            }
+
+            taskOpen = false;
+            hunting = true;
+
+            taskOpenChecks = 0;
+            workspaceChecks = 0;
+
+            updateIndicator();
+
+            console.log(
+                '[Tennr Hunt] Workspace idle. Resuming hunt.'
+            );
+
+            runCycle();
+        }, RESUME_DELAY);
+    }
+
+    function monitorPageState() {
+        const faxOpen =
+            isFaxTaskOpen();
+
+        if (faxOpen) {
+            taskOpenChecks += 1;
+            workspaceChecks = 0;
+
+            if (
+                taskOpenChecks >=
+                TASK_OPEN_CONFIRMATIONS
+            ) {
+                pauseForOpenTask();
+            }
+
+            return;
+        }
+
+        taskOpenChecks = 0;
+
+        if (
+            taskOpen &&
+            autoModeEnabled
+        ) {
+            if (isIdleWorkspaceOpen()) {
+                workspaceChecks += 1;
+            } else {
+                workspaceChecks = 0;
+            }
+
+            if (
+                workspaceChecks >=
+                WORKSPACE_CONFIRMATIONS
+            ) {
+                taskOpen = false;
+                hunting = true;
+
+                workspaceChecks = 0;
+
+                updateIndicator();
+
+                console.log(
+                    '[Tennr Hunt] Workspace confirmed idle. Resuming.'
+                );
+
+                runCycle();
+            }
+
+            return;
+        }
+
+        if (
+            hunting &&
+            !taskOpen &&
+            !isIdleWorkspaceOpen()
+        ) {
+            workspaceChecks = 0;
+        }
+    }
+
+    function isAssignmentObject(value) {
+        if (
+            !value ||
+            typeof value !== 'object' ||
+            Array.isArray(value)
+        ) {
+            return false;
+        }
+
+        return Boolean(
+            value.id ||
+            value.workflowStateId ||
+            value.assistantInteractionId
+        );
+    }
+
+    function handleTaskCandidate(candidate) {
+        if (!candidate) {
+            return;
+        }
+
+        lastTaskCandidate = candidate;
+
+        stats.apiCandidates += 1;
+        saveStats();
+
+        console.log(
+            '[Tennr Hunt] API candidate:',
+            candidate
+        );
+
+        /*
+         * The server has assigned a task. Stop API polling immediately.
+         */
+        stopApiHunter();
+
+        /*
+         * Let the existing page-state detection confirm whether
+         * Tennr has opened the actual fax UI.
+         */
+        monitorPageState();
+
+        setTimeout(() => {
+            monitorPageState();
+        }, 100);
+
+        setTimeout(() => {
+            monitorPageState();
+        }, 300);
+
+        /*
+         * Direct API assignment updates the server-side assignment,
+         * but it does not necessarily update Tennr's React state.
+         *
+         * Reloading gives Tennr its normal opportunity to load the
+         * newly assigned task.
+         */
+        if (!isFaxTaskOpen()) {
+            if (
+                apiAssignmentReloadTimeout !== null
+            ) {
+                clearTimeout(
+                    apiAssignmentReloadTimeout
+                );
+            }
+
+            apiAssignmentReloadTimeout =
+                setTimeout(() => {
+                    apiAssignmentReloadTimeout = null;
+
+                    if (
+                        !autoModeEnabled ||
+                        !lastTaskCandidate
+                    ) {
+                        return;
+                    }
+
+                    console.log(
+                        '[Tennr Hunt] Reloading after API assignment.'
+                    );
+
+                    location.reload();
+                }, API_ASSIGNMENT_RELOAD_DELAY);
+        }
+    }
+
+    function inspectTaskResponse(data) {
+        try {
+            const result =
+                data?.[0]?.result?.data?.json;
+
+            if (
+                result === null ||
+                result === undefined ||
+                result === false
+            ) {
+                return;
+            }
+
+            if (
+                typeof result === 'object' &&
+                !Array.isArray(result) &&
+                Object.keys(result).length === 0
+            ) {
+                return;
+            }
+
+            if (isAssignmentObject(result)) {
+                handleTaskCandidate(result);
+            }
+        } catch (error) {
+            console.debug(
+                '[Tennr Hunt] Could not inspect API result:',
+                error
+            );
+        }
+    }
+
+    function getFetchAuthInfo(args) {
+        try {
+            const request = args?.[0];
+            const init = args?.[1];
+
+            let url = '';
+
+            if (typeof request === 'string') {
+                url = request;
+            } else if (request?.url) {
+                url = request.url;
+            }
+
+            let headers = {};
+
+            if (request?.headers) {
+                headers = request.headers;
+            }
+
+            if (init?.headers) {
+                headers = init.headers;
+            }
+
+            let authorization = null;
+            let timezone = null;
+
+            if (
+                headers instanceof Headers
+            ) {
+                authorization =
+                    headers.get('authorization');
+
+                timezone =
+                    headers.get('x-user-timezone');
+            } else if (
+                Array.isArray(headers)
+            ) {
+                const map =
+                    Object.fromEntries(
+                        headers.map(
+                            ([key, value]) => [
+                                String(key).toLowerCase(),
+                                value
+                            ]
+                        )
+                    );
+
+                authorization =
+                    map.authorization || null;
+
+                timezone =
+                    map['x-user-timezone'] || null;
+            } else if (
+                headers &&
+                typeof headers === 'object'
+            ) {
+                const map = {};
+
+                Object.keys(headers).forEach(
+                    (key) => {
+                        map[
+                            key.toLowerCase()
+                        ] = headers[key];
+                    }
+                );
+
+                authorization =
+                    map.authorization || null;
+
+                timezone =
+                    map['x-user-timezone'] || null;
+            }
+
+            return {
+                url,
+                authorization,
+                timezone
+            };
+        } catch (error) {
+            return {
+                url: '',
+                authorization: null,
+                timezone: null
+            };
+        }
+    }
+
+    function extractUserIdFromUrl(url) {
+        try {
+            const marker =
+                'fetchAndAssignNextTask';
+
+            const markerIndex =
+                url.indexOf(marker);
+
+            if (markerIndex === -1) {
+                return null;
+            }
+
+            const inputIndex =
+                url.indexOf(
+                    'input=',
+                    markerIndex
+                );
+
+            if (inputIndex === -1) {
+                return null;
+            }
+
+            const encodedInput =
+                url.slice(
+                    inputIndex + 6
+                );
+
+            const params =
+                new URLSearchParams(
+                    '?' + encodedInput
+                );
+
+            const input =
+                params.get('input');
+
+            if (!input) {
+                return null;
+            }
+
+            const parsed =
+                JSON.parse(input);
+
+            return (
+                parsed?.['0']?.json?.userId ||
+                null
+            );
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function rememberApiSession(args) {
+        try {
+            const info =
+                getFetchAuthInfo(args);
+
+            if (!info.url) {
+                return;
+            }
+
+            if (
+                !info.url.includes(
+                    'fetchAndAssignNextTask'
+                )
+            ) {
+                return;
+            }
+
+            if (info.authorization) {
+                apiAuthorization =
+                    info.authorization;
+            }
+
+            if (info.timezone) {
+                apiTimezone =
+                    info.timezone;
+            }
+
+            const userId =
+                extractUserIdFromUrl(
+                    info.url
+                );
+
+            if (userId) {
+                apiUserId = userId;
+            }
+        } catch (error) {
+            console.debug(
+                '[Tennr Hunt] Could not remember API session:',
+                error
+            );
+        }
+    }
+
+    function buildApiUrl() {
+        const input = {
+            0: {
+                json: {
+                    userId: apiUserId
+                }
+            }
+        };
+
+        const encodedInput =
+            encodeURIComponent(
+                JSON.stringify(input)
+            );
+
+        return (
+            `${location.origin}/api/trpc/` +
+            `workspace.fetchAndAssignNextTask` +
+            `?batch=1&input=${encodedInput}`
+        );
+    }
+
+    function stopApiHunter() {
+        if (apiPollTimer !== null) {
+            clearInterval(apiPollTimer);
+            apiPollTimer = null;
+        }
+
+        apiRequestInFlight = false;
+    }
+
+    function startApiHunter() {
+        stopApiHunter();
+
+        if (
+            !autoModeEnabled ||
+            !hunting ||
+            taskOpen
+        ) {
+            return;
+        }
+
+        console.log(
+            '[Tennr Hunt] API hunter started.'
+        );
+
+        pollNextTask();
+
+        apiPollTimer =
+            setInterval(() => {
+                pollNextTask();
+            }, API_POLL_INTERVAL);
+    }
+
+    async function pollNextTask() {
+        if (
+            apiRequestInFlight ||
+            !autoModeEnabled ||
+            !hunting ||
+            taskOpen
+        ) {
+            return;
+        }
+
+        if (
+            !apiAuthorization ||
+            !apiUserId
+        ) {
+            return;
+        }
+
+        apiRequestInFlight = true;
+
+        stats.apiAttempts += 1;
+        saveStats();
+
+        try {
+            const url =
+                buildApiUrl();
+
+            const headers = {
+                accept: '*/*',
+                authorization:
+                    apiAuthorization
+            };
+
+            if (apiTimezone) {
+                headers[
+                    'x-user-timezone'
+                ] = apiTimezone;
+            }
+
+            const fetchFunction =
+                nativeFetch ||
+                window.fetch;
+
+            const response =
+                await fetchFunction(
+                    url,
+                    {
+                        method: 'GET',
+                        headers,
+                        credentials: 'include'
+                    }
+                );
+
+            if (
+                !response.ok
+            ) {
+                console.debug(
+                    '[Tennr Hunt] API hunter HTTP status:',
+                    response.status
+                );
+
+                /*
+                 * Authentication may have expired.
+                 * Clear it and wait for Tennr's next normal request
+                 * to provide a fresh authorization header.
+                 */
+                if (
+                    response.status === 401 ||
+                    response.status === 403
+                ) {
+                    apiAuthorization = null;
+                }
+
+                return;
+            }
+
+            const data =
+                await response.json();
+
+            const result =
+                data?.[0]?.result?.data?.json;
+
+            /*
+             * null / undefined / false / empty object means:
+             * no fax is available right now.
+             *
+             * Keep polling.
+             */
+            if (
+                result === null ||
+                result === undefined ||
+                result === false ||
+                (
+                    typeof result === 'object' &&
+                    !Array.isArray(result) &&
+                    Object.keys(result).length === 0
+                )
+            ) {
+                return;
+            }
+
+            /*
+             * Anything resembling an assignment means the server
+             * successfully assigned a task.
+             */
+            if (
+                isAssignmentObject(result)
+            ) {
+                console.log(
+                    '[Tennr Hunt] API task assigned.'
+                );
+
+                handleTaskCandidate(result);
+            }
+        } catch (error) {
+            console.debug(
+                '[Tennr Hunt] API hunter request failed:',
+                error
+            );
+        } finally {
+            apiRequestInFlight = false;
+        }
+    }
+
+    function hookFetch() {
+        if (
+            typeof window.fetch !== 'function' ||
+            window.fetch.__tennrAutoHuntHooked
+        ) {
+            return;
+        }
+
+        const originalFetch =
+            window.fetch;
+
+        nativeFetch =
+            originalFetch;
+
+        async function hookedFetch(...args) {
+            /*
+             * Capture Tennr's authenticated request context before
+             * the request is sent.
+             *
+             * The authorization token is kept only in memory.
+             * It is never logged or saved to localStorage.
+             */
+            rememberApiSession(args);
+
+            const response =
+                await originalFetch.apply(
+                    this,
+                    args
+                );
+
+            try {
+                const request =
+                    args[0];
+
+                const url =
+                    typeof request === 'string'
+                        ? request
+                        : request?.url || '';
+
+                /*
+                 * Preserve the existing V6.3 API detection.
+                 */
+                if (
+                    url.includes(
+                        'fetchAndAssignNextTask'
+                    )
+                ) {
+                    response
+                        .clone()
+                        .json()
+                        .then((data) => {
+                            inspectTaskResponse(
+                                data
+                            );
+                        })
+                        .catch((error) => {
+                            console.debug(
+                                '[Tennr Hunt] Response was not JSON:',
+                                error
+                            );
+                        });
+                }
+            } catch (error) {
+                console.debug(
+                    '[Tennr Hunt] Could not inspect request:',
+                    error
+                );
+            }
+
+            return response;
+        }
+
+        hookedFetch.__tennrAutoHuntHooked =
+            true;
+
+        window.fetch =
+            hookedFetch;
+    }
+
+    function startPageObserver() {
+        if (
+            taskObserver ||
+            !document.body
+        ) {
+            return;
+        }
+
+        let observerCheckPending =
+            false;
+
+        taskObserver =
+            new MutationObserver(() => {
+                if (observerCheckPending) {
+                    return;
+                }
+
+                observerCheckPending =
+                    true;
+
+                requestAnimationFrame(() => {
+                    observerCheckPending =
+                        false;
+
+                    monitorPageState();
+                });
+            });
+
+        taskObserver.observe(
+            document.body,
+            {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: [
+                    'class',
+                    'style',
+                    'hidden',
+                    'aria-hidden',
+                    'title',
+                    'data-testid',
+                    'data-page-number',
+                    'data-validate-scroll-target'
+                ]
+            }
+        );
+    }
+
+    function startPageMonitor() {
+        if (
+            pageMonitorTimer !== null
+        ) {
+            return;
+        }
+
+        pageMonitorTimer =
+            setInterval(() => {
+                monitorPageState();
+            }, PAGE_CHECK_INTERVAL);
+    }
+
+    function handleNavigationChange() {
+        monitorPageState();
+
+        requestAnimationFrame(() => {
+            monitorPageState();
+        });
+
+        setTimeout(() => {
+            monitorPageState();
+        }, 100);
+
+        setTimeout(() => {
+            monitorPageState();
+        }, 300);
+    }
+
+    function hookHistoryChanges() {
+        if (
+            window.__tennrAutoHuntHistoryHooked
+        ) {
+            return;
+        }
+
+        window.__tennrAutoHuntHistoryHooked =
+            true;
+
+        const originalPushState =
+            history.pushState;
+
+        const originalReplaceState =
+            history.replaceState;
+
+        history.pushState =
+            function (...args) {
+                const result =
+                    originalPushState.apply(
+                        this,
+                        args
+                    );
+
+                handleNavigationChange();
+
+                return result;
+            };
+
+        history.replaceState =
+            function (...args) {
+                const result =
+                    originalReplaceState.apply(
+                        this,
+                        args
+                    );
+
+                handleNavigationChange();
+
+                return result;
+            };
+
+        window.addEventListener(
+            'popstate',
+            handleNavigationChange
+        );
+
+        window.addEventListener(
+            'hashchange',
+            handleNavigationChange
+        );
+    }
+
+    function runCycle() {
+        if (
+            !autoModeEnabled ||
+            !hunting ||
+            taskOpen
+        ) {
+            return;
+        }
+
+        if (isFaxTaskOpen()) {
+            pauseForOpenTask();
+            return;
+        }
+
+        cycleStartUrl =
+            location.href;
+
+        stats.retries += 1;
+        saveStats();
+
+        updateIndicator();
+
+        /*
+         * New V6.4 behavior:
+         *
+         * Do not spam Ctrl+Enter.
+         * Continuously ask the Tennr assignment endpoint instead.
+         */
+        startApiHunter();
+    }
+
+    function startHunt() {
+        autoModeEnabled = true;
+
+        localStorage.setItem(
+            AUTO_HUNT_KEY,
+            'on'
+        );
+
+        clearHuntTimers();
+        clearResumeTimer();
+
+        /*
+         * F8 while a fax is already open arms auto-resume
+         * without making another assignment request.
+         */
+        if (isFaxTaskOpen()) {
+            taskOpen = true;
+            hunting = false;
+
+            taskOpenChecks = 0;
+            workspaceChecks = 0;
+
+            updateIndicator();
+
+            console.log(
+                '[Tennr Hunt] Auto-resume armed while fax is open.'
+            );
+
+            return;
+        }
+
+        if (
+            hunting &&
+            !taskOpen
+        ) {
+            updateIndicator();
+            return;
+        }
+
+        taskOpen = false;
+        hunting = true;
+
+        lastTaskCandidate = null;
+
+        taskOpenChecks = 0;
+        workspaceChecks = 0;
+
+        cycleStartUrl =
+            location.href;
+
+        updateIndicator();
+
+        console.log(
+            '[Tennr Hunt] Hunt started with F8.'
+        );
+
+        runCycle();
+    }
+
+    function stopHunt() {
+        autoModeEnabled = false;
+        hunting = false;
+        taskOpen = false;
+
+        lastTaskCandidate = null;
+
+        taskOpenChecks = 0;
+        workspaceChecks = 0;
+
+        localStorage.setItem(
+            AUTO_HUNT_KEY,
+            'off'
+        );
+
+        clearHuntTimers();
+        clearResumeTimer();
+
+        updateIndicator();
+
+        console.log(
+            '[Tennr Hunt] Hunt stopped with F9.'
+        );
+    }
+
+    function isTypingTarget(element) {
+        if (
+            !(element instanceof Element)
+        ) {
+            return false;
+        }
+
+        return Boolean(
+            element.closest(
+                'input, textarea, select, [contenteditable="true"]'
+            )
+        );
+    }
+
+    function installKeyboardShortcuts() {
+        if (
+            window.__tennrAutoHuntShortcutsInstalled
+        ) {
+            return;
+        }
+
+        window.__tennrAutoHuntShortcutsInstalled =
+            true;
+
+        window.addEventListener(
+            'keydown',
+            (event) => {
+                if (event.repeat) {
+                    return;
+                }
+
+                if (
+                    isTypingTarget(
+                        event.target
+                    )
+                ) {
+                    return;
+                }
+
+                if (
+                    event.key === START_KEY
+                ) {
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    startHunt();
+                    return;
+                }
+
+                if (
+                    event.key === STOP_KEY
+                ) {
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    stopHunt();
+                }
+            },
+            true
+        );
+    }
+
+    function restoreSavedState() {
+        if (!autoModeEnabled) {
+            hunting = false;
+            taskOpen = false;
+
+            updateIndicator();
+
+            return;
+        }
+
+        setTimeout(() => {
+            if (!autoModeEnabled) {
+                return;
+            }
+
+            if (isFaxTaskOpen()) {
+                taskOpen = true;
+                hunting = false;
+
+                updateIndicator();
+
+                console.log(
+                    '[Tennr Hunt] Open fax detected after reload.'
+                );
+
+                return;
+            }
+
+            taskOpen = false;
+            hunting = true;
+
+            cycleStartUrl =
+                location.href;
+
+            updateIndicator();
+
+            runCycle();
+        }, 1000);
+    }
+
+    function initializeTennrHunt() {
+        if (
+            !document.head ||
+            !document.body
+        ) {
+            return false;
+        }
+
+        try {
+            createStatusIndicator();
+
+            installKeyboardShortcuts();
+
+            hookFetch();
+
+            hookHistoryChanges();
+
+            startPageObserver();
+
+            startPageMonitor();
+
+            restoreSavedState();
+        } catch (error) {
+            console.error(
+                '[Tennr Hunt] Initialization failed:',
+                error
+            );
+
+            return false;
+        }
+
+        return true;
+    }
+
+    if (!initializeTennrHunt()) {
+        const loader =
+            setInterval(() => {
+                if (
+                    initializeTennrHunt()
+                ) {
+                    clearInterval(loader);
+                }
+            }, 100);
+    }
+})();
