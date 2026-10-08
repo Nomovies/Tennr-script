@@ -1,0 +1,352 @@
+// ==UserScript==
+// @name         Tennr API Discovery - XHR
+// @namespace    tennr
+// @version      1.0
+// @description  Discover Tennr fetchAndAssignNextTask XHR requests
+// @match        https://app.tennr.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window.__tennrXHRDiscovery) return;
+    window.__tennrXHRDiscovery = true;
+
+    const TARGET = 'fetchAndAssignNextTask';
+
+    const SECRET_HEADERS = new Set([
+        'authorization',
+        'cookie',
+        'set-cookie',
+        'proxy-authorization',
+        'x-api-key',
+        'x-auth-token',
+        'x-access-token',
+        'x-csrf-token'
+    ]);
+
+    function truncate(value, max = 1000) {
+
+        if (typeof value !== 'string')
+            return value;
+
+        return value.length > max
+            ? value.slice(0, max) + '...[truncated]'
+            : value;
+    }
+
+    function safeHeaders(headers) {
+
+        const result = {};
+
+        try {
+
+            const lines =
+                String(headers || '')
+                    .split(/\r?\n/)
+                    .filter(Boolean);
+
+            for (const line of lines) {
+
+                const separator =
+                    line.indexOf(':');
+
+                if (separator === -1)
+                    continue;
+
+                const name =
+                    line
+                        .slice(0, separator)
+                        .trim();
+
+                const value =
+                    line
+                        .slice(separator + 1)
+                        .trim();
+
+                const normalized =
+                    name.toLowerCase();
+
+                result[name] =
+                    SECRET_HEADERS.has(normalized)
+                        ? '[REDACTED]'
+                        : truncate(value);
+            }
+
+        }
+        catch (e) {
+
+            result.__error =
+                String(e);
+        }
+
+        return result;
+    }
+
+    function responseShape(value, depth = 0) {
+
+        if (depth > 4)
+            return '[MAX DEPTH]';
+
+        if (value === null)
+            return null;
+
+        if (Array.isArray(value)) {
+
+            return {
+                type: 'array',
+                length: value.length,
+                firstItem:
+                    value.length
+                        ? responseShape(
+                            value[0],
+                            depth + 1
+                        )
+                        : null
+            };
+        }
+
+        if (typeof value === 'object') {
+
+            const result = {
+                type: 'object',
+                keys: Object.keys(value)
+            };
+
+            for (const key of [
+                'result',
+                'data',
+                'json'
+            ]) {
+
+                if (
+                    Object.prototype.hasOwnProperty.call(
+                        value,
+                        key
+                    )
+                ) {
+
+                    result[key] =
+                        responseShape(
+                            value[key],
+                            depth + 1
+                        );
+                }
+            }
+
+            return result;
+        }
+
+        return {
+            type: typeof value
+        };
+    }
+
+    const originalOpen =
+        XMLHttpRequest.prototype.open;
+
+    const originalSend =
+        XMLHttpRequest.prototype.send;
+
+    const originalSetRequestHeader =
+        XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.open =
+        function (
+            method,
+            url,
+            ...rest
+        ) {
+
+            this.__tennrDiscovery = {
+                method: method,
+                url: String(url),
+                headers: {}
+            };
+
+            return originalOpen.call(
+                this,
+                method,
+                url,
+                ...rest
+            );
+        };
+
+    XMLHttpRequest.prototype.setRequestHeader =
+        function (
+            name,
+            value
+        ) {
+
+            if (!this.__tennrDiscovery) {
+
+                this.__tennrDiscovery = {
+                    method: null,
+                    url: '',
+                    headers: {}
+                };
+            }
+
+            const normalized =
+                String(name).toLowerCase();
+
+            this.__tennrDiscovery.headers[name] =
+                SECRET_HEADERS.has(normalized)
+                    ? '[REDACTED]'
+                    : truncate(String(value));
+
+            return originalSetRequestHeader.call(
+                this,
+                name,
+                value
+            );
+        };
+
+    XMLHttpRequest.prototype.send =
+        function (body) {
+
+            const info =
+                this.__tennrDiscovery;
+
+            const matched =
+                info &&
+                info.url.includes(TARGET);
+
+            if (matched) {
+
+                console.group(
+                    '%c[Tennr XHR Discovery] MATCH',
+                    'color:#ea580c;font-weight:bold'
+                );
+
+                console.log(
+                    'METHOD:',
+                    info.method
+                );
+
+                console.log(
+                    'URL:',
+                    info.url
+                );
+
+                console.log(
+                    'HEADERS:',
+                    info.headers
+                );
+
+                console.log(
+                    'BODY:',
+                    typeof body === 'string'
+                        ? truncate(body)
+                        : body == null
+                            ? null
+                            : `[${body?.constructor?.name || typeof body}]`
+                );
+
+                console.log(
+                    'Do NOT send cookies, authorization tokens or session IDs.'
+                );
+
+                console.groupEnd();
+
+                this.addEventListener(
+                    'load',
+                    function () {
+
+                        console.group(
+                            '%c[Tennr XHR Discovery] RESPONSE',
+                            'color:#7c3aed;font-weight:bold'
+                        );
+
+                        console.log(
+                            'HTTP:',
+                            this.status,
+                            this.statusText
+                        );
+
+                        console.log(
+                            'Response headers:',
+                            safeHeaders(
+                                this.getAllResponseHeaders()
+                            )
+                        );
+
+                        try {
+
+                            const contentType =
+                                this.getResponseHeader(
+                                    'content-type'
+                                ) || '';
+
+                            if (
+                                contentType.includes(
+                                    'application/json'
+                                )
+                            ) {
+
+                                const data =
+                                    JSON.parse(
+                                        this.responseText
+                                    );
+
+                                console.log(
+                                    'Response shape:',
+                                    responseShape(data)
+                                );
+
+                            }
+                            else {
+
+                                console.log(
+                                    'Response is not JSON.'
+                                );
+                            }
+
+                        }
+                        catch (e) {
+
+                            console.debug(
+                                '[Tennr XHR Discovery] Response parsing failed:',
+                                e
+                            );
+                        }
+
+                        console.groupEnd();
+                    }
+                );
+            }
+
+            return originalSend.call(
+                this,
+                body
+            );
+        };
+
+    window.tennrXHRDiscovery = {
+
+        uninstall() {
+
+            XMLHttpRequest.prototype.open =
+                originalOpen;
+
+            XMLHttpRequest.prototype.send =
+                originalSend;
+
+            XMLHttpRequest.prototype.setRequestHeader =
+                originalSetRequestHeader;
+
+            delete window.__tennrXHRDiscovery;
+
+            console.log(
+                '[Tennr XHR Discovery] Uninstalled.'
+            );
+        }
+    };
+
+    console.log(
+        '%c[Tennr XHR Discovery] Installed',
+        'color:#ea580c;font-weight:bold'
+    );
+
+})();
