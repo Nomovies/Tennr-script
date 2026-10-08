@@ -1,0 +1,349 @@
+// ==UserScript==
+// @name         Tennr API Discovery - Fetch
+// @namespace    tennr
+// @version      1.0
+// @description  Discover Tennr fetchAndAssignNextTask requests
+// @match        https://app.tennr.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window.__tennrFetchDiscovery) return;
+    window.__tennrFetchDiscovery = true;
+
+    const TARGET = 'fetchAndAssignNextTask';
+
+    const SECRET_HEADERS = new Set([
+        'authorization',
+        'cookie',
+        'set-cookie',
+        'proxy-authorization',
+        'x-api-key',
+        'x-auth-token',
+        'x-access-token',
+        'x-csrf-token'
+    ]);
+
+    function truncate(value, max = 1000) {
+        if (typeof value !== 'string') return value;
+        return value.length > max
+            ? value.slice(0, max) + '...[truncated]'
+            : value;
+    }
+
+    function getSafeHeaders(headers) {
+        const result = {};
+
+        try {
+            if (headers instanceof Headers) {
+                headers.forEach((value, key) => {
+                    const name = key.toLowerCase();
+
+                    result[key] =
+                        SECRET_HEADERS.has(name)
+                            ? '[REDACTED]'
+                            : truncate(value);
+                });
+            }
+            else if (headers && typeof headers === 'object') {
+                for (const [key, value] of Object.entries(headers)) {
+                    const name = key.toLowerCase();
+
+                    result[key] =
+                        SECRET_HEADERS.has(name)
+                            ? '[REDACTED]'
+                            : truncate(String(value));
+                }
+            }
+        }
+        catch (e) {
+            result.__error = String(e);
+        }
+
+        return result;
+    }
+
+    function describeBody(body) {
+
+        if (body == null) {
+            return {
+                present: false,
+                type: null
+            };
+        }
+
+        if (typeof body === 'string') {
+            return {
+                present: true,
+                type: 'string',
+                length: body.length,
+                value: truncate(body)
+            };
+        }
+
+        if (body instanceof URLSearchParams) {
+            return {
+                present: true,
+                type: 'URLSearchParams',
+                value: truncate(body.toString())
+            };
+        }
+
+        if (body instanceof FormData) {
+            const fields = [];
+
+            try {
+                for (const [key, value] of body.entries()) {
+                    fields.push({
+                        key,
+                        type: typeof value,
+                        value:
+                            typeof value === 'string'
+                                ? truncate(value)
+                                : `[${value?.constructor?.name || 'object'}]`
+                    });
+                }
+            }
+            catch (e) {
+                fields.push({
+                    error: String(e)
+                });
+            }
+
+            return {
+                present: true,
+                type: 'FormData',
+                fields
+            };
+        }
+
+        if (body instanceof Blob) {
+            return {
+                present: true,
+                type: 'Blob',
+                mimeType: body.type,
+                size: body.size
+            };
+        }
+
+        if (body instanceof ReadableStream) {
+            return {
+                present: true,
+                type: 'ReadableStream',
+                value: '[NOT READ]'
+            };
+        }
+
+        return {
+            present: true,
+            type: body?.constructor?.name || typeof body,
+            value: '[OBJECT NOT SERIALIZED]'
+        };
+    }
+
+    function inspectRequest(args) {
+
+        const input = args[0];
+        const init = args[1] || {};
+
+        let url = '';
+        let method = init.method || null;
+        let headers = init.headers || null;
+        let body = init.body ?? null;
+
+        try {
+
+            if (typeof input === 'string') {
+                url = input;
+            }
+
+            else if (input instanceof Request) {
+
+                url = input.url;
+
+                if (!method)
+                    method = input.method;
+
+                if (!headers)
+                    headers = input.headers;
+
+                body =
+                    body ??
+                    '[Request body not read]';
+            }
+
+            else if (input && typeof input === 'object') {
+
+                url = input.url || '';
+
+                if (!method)
+                    method = input.method;
+
+                if (!headers)
+                    headers = input.headers;
+            }
+        }
+        catch (e) {
+            console.debug(
+                '[Tennr Fetch Discovery] Request inspection error:',
+                e
+            );
+        }
+
+        return {
+            url,
+            method: method || 'GET',
+            headers: getSafeHeaders(headers),
+            body: describeBody(body)
+        };
+    }
+
+    function responseShape(value, depth = 0) {
+
+        if (depth > 4)
+            return '[MAX DEPTH]';
+
+        if (value === null)
+            return null;
+
+        if (Array.isArray(value)) {
+
+            return {
+                type: 'array',
+                length: value.length,
+                firstItem:
+                    value.length
+                        ? responseShape(
+                            value[0],
+                            depth + 1
+                        )
+                        : null
+            };
+        }
+
+        if (typeof value === 'object') {
+
+            const result = {
+                type: 'object',
+                keys: Object.keys(value)
+            };
+
+            for (const key of [
+                'result',
+                'data',
+                'json'
+            ]) {
+
+                if (
+                    Object.prototype.hasOwnProperty.call(
+                        value,
+                        key
+                    )
+                ) {
+                    result[key] =
+                        responseShape(
+                            value[key],
+                            depth + 1
+                        );
+                }
+            }
+
+            return result;
+        }
+
+        return {
+            type: typeof value
+        };
+    }
+
+    const originalFetch = window.fetch;
+
+    window.fetch = async function (...args) {
+
+        const request = inspectRequest(args);
+
+        const matched =
+            request.url.includes(TARGET);
+
+        if (matched) {
+
+            console.group(
+                '%c[Tennr Fetch Discovery] MATCH',
+                'color:#16a34a;font-weight:bold'
+            );
+
+            console.log(
+                'REQUEST:',
+                request
+            );
+
+            console.log(
+                'Do NOT send cookies, authorization tokens or session IDs.'
+            );
+
+            console.groupEnd();
+        }
+
+        const response =
+            await originalFetch.apply(
+                this,
+                args
+            );
+
+        if (matched) {
+
+            try {
+
+                response
+                    .clone()
+                    .json()
+                    .then(data => {
+
+                        console.log(
+                            '%c[Tennr Fetch Discovery] RESPONSE SHAPE:',
+                            'color:#7c3aed;font-weight:bold',
+                            responseShape(data)
+                        );
+
+                    })
+                    .catch(() => {});
+            }
+            catch (e) {
+                console.debug(
+                    '[Tennr Fetch Discovery] Response inspection failed:',
+                    e
+                );
+            }
+
+            console.log(
+                '[Tennr Fetch Discovery] HTTP:',
+                response.status,
+                response.statusText
+            );
+        }
+
+        return response;
+    };
+
+    window.tennrFetchDiscovery = {
+
+        uninstall() {
+
+            window.fetch = originalFetch;
+
+            delete window.__tennrFetchDiscovery;
+
+            console.log(
+                '[Tennr Fetch Discovery] Uninstalled.'
+            );
+        }
+    };
+
+    console.log(
+        '%c[Tennr Fetch Discovery] Installed',
+        'color:#2563eb;font-weight:bold'
+    );
+
+})();
